@@ -12,6 +12,8 @@ import cv2
 import os
 import sys
 import threading
+from collections import deque
+from threading import Lock
 
 if sys.platform.startswith('linux'):
     os.environ.setdefault("PYOPENGL_PLATFORM", "glx")
@@ -34,7 +36,7 @@ from radar import RadarPlotWidget, RadarComputeWorker
 from usb_port import USBPortSelector, USBPortScanner
 import time
 
-GUI_VERSION = "2.3.5"
+GUI_VERSION = "2.3.9"
 
 def _resource_path(rel):
     """定位随包资源文件。
@@ -55,6 +57,93 @@ def _read_api_version():
         return "unknown"
 
 API_VERSION = _read_api_version()
+
+
+class LatestValueMailbox:
+    """Keep the latest value without queuing one notification per publish.
+
+    A successful notification claim remains pending until ``take``. ``None``
+    denotes an empty mailbox and cannot be published.
+    """
+
+    def __init__(self):
+        self._lock = Lock()
+        self._value = None
+        self._notification_pending = False
+        self._closed = False
+
+    def publish(self, value):
+        """Replace the pending value; return whether the caller must notify."""
+        if value is None:
+            raise ValueError("None is reserved for an empty mailbox")
+        with self._lock:
+            if self._closed:
+                return False
+            self._value = value
+            if self._notification_pending:
+                return False
+            self._notification_pending = True
+            return True
+
+    def take(self):
+        """Take the latest value and permit the next publish to notify."""
+        with self._lock:
+            value = self._value
+            self._value = None
+            self._notification_pending = False
+            return value
+
+    def clear(self):
+        """Discard the value while preserving any pending notification claim."""
+        with self._lock:
+            self._value = None
+
+    def close(self):
+        """Discard the value and permanently reject subsequent publishes."""
+        with self._lock:
+            self._closed = True
+            self._value = None
+            self._notification_pending = False
+
+
+class FrameRateCounter:
+    """Count completions in the trailing one and five seconds of a session."""
+
+    def __init__(self, *, clock=time.perf_counter):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._events = deque()
+        self._started_at = clock()
+
+    def _prune(self, now):
+        while self._events and self._events[0] <= now - 5.0:
+            self._events.popleft()
+
+    def record(self):
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            self._events.append(now)
+
+    def reset(self):
+        with self._lock:
+            self._events.clear()
+            self._started_at = self._clock()
+
+    def snapshot(self):
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            elapsed = max(now - self._started_at, 0.0)
+            count = len(self._events)
+            recent = sum(stamp > now - 1.0 for stamp in self._events)
+            return {
+                'fps': recent / min(elapsed, 1.0) if elapsed > 0 else 0.0,
+                'avg_fps': count / min(elapsed, 5.0) if elapsed > 0 else 0.0,
+                'warming_up': elapsed < 5.0,
+                'count': count,
+            }
+
 
 class ThroughPoleOrbitMixin:
     """允许相机从模型顶部翻转到模型底部"""
@@ -342,23 +431,25 @@ class InstancedConeItem(GLGraphicsItem):
         GL.glUseProgram(0)
 
 class SensorUpdateWorker(QtCore.QThread):
-    """QThread-based sensor worker: emits new_frame signal per sensor update.
-
-    Every completed sensor frame is delivered directly to the GUI main thread
-    via Qt signal/slot, eliminating polling latency and frame misses.
-    GUI FPS now tracks sensor FPS exactly with zero frame loss.
-    """
-    new_frame = QtCore.pyqtSignal(dict)
+    """Update the sensor and notify the GUI of the latest completed snapshot."""
+    frame_available = QtCore.pyqtSignal()
     error_occurred = QtCore.pyqtSignal(str)
 
     def __init__(self, sensor):
         super().__init__()
         self.sensor = sensor
+        self._frame_mailbox = LatestValueMailbox()
         self.seq = 0
         
         
         self._last_frame_data = None   
         self._consecutive_same_frames = 0
+
+    def take_latest_frame(self):
+        return self._frame_mailbox.take()
+
+    def close_mailbox(self):
+        self._frame_mailbox.close()
 
     @staticmethod
     def _copy_matrix(matrix):
@@ -420,35 +511,53 @@ class SensorUpdateWorker(QtCore.QThread):
                     'autocal_count': self.sensor.auto_calibration_frame_count,
                     'autocal_spike': self.sensor.auto_calibration_spike_count,
                 }
-                self.new_frame.emit(packet)
+                if self._frame_mailbox.publish(packet):
+                    self.frame_available.emit()
             except Exception as e:
                 self.error_occurred.emit(str(e))
-                time.sleep(0.05)
+                break
 
 
 class RadarFeatureWorker(QtCore.QThread):
     """雷达特征计算线程：只处理最新输入帧（忙时丢帧，latest-wins），
-    结果通过 radar_ready 信号发回主线程，避免 GUI 线程承担 numpy 计算。"""
+    结果通过合并通知交给主线程，避免 GUI 线程承担 numpy 计算。"""
 
-    radar_ready = QtCore.pyqtSignal(object)  
+    result_available = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.radar_compute = RadarComputeWorker()
+        self._result_mailbox = LatestValueMailbox()
         self._input = None
         self._input_lock = threading.Lock()
         self._input_ready = threading.Event()
         self._reset_requested = False
+        self._input_closed = False
+
+    def take_latest_result(self):
+        return self._result_mailbox.take()
+
+    def close_mailbox(self):
+        self._result_mailbox.close()
+        with self._input_lock:
+            self._input_closed = True
+            self._input = None
+            self._reset_requested = False
 
     def submit(self, frame_data):
         """主线程提交最新帧；worker 忙时旧输入被覆盖（latest-wins）。"""
         with self._input_lock:
+            if self._input_closed:
+                return
             self._input = frame_data
             self._input_ready.set()
 
     def request_reset(self):
         """请求在 worker 线程内清空 RadarComputeWorker 跨帧状态（校准/换设备后）。"""
+        self._result_mailbox.clear()
         with self._input_lock:
+            if self._input_closed:
+                return
             self._reset_requested = True
             self._input = None
             self._input_ready.set()
@@ -460,15 +569,13 @@ class RadarFeatureWorker(QtCore.QThread):
         while not self.isInterruptionRequested():
             self._input_ready.wait(0.05)
             with self._input_lock:
-                if self._reset_requested:
-                    self._reset_requested = False
-                    self._input = None
-                    self._input_ready.clear()
-                    self.radar_compute.reset()
-                    continue
+                reset_requested = self._reset_requested
+                self._reset_requested = False
                 frame = self._input
                 self._input = None
                 self._input_ready.clear()
+            if reset_requested:
+                self.radar_compute.reset()
             if frame is None:
                 continue
             try:
@@ -484,14 +591,16 @@ class RadarFeatureWorker(QtCore.QThread):
                     frame["contact_threshold"],
                 )
                 compute_ms = (time.perf_counter() - t0) * 1000.0
-                self.radar_ready.emit({
+                result = {
                     "generation": frame["generation"],
                     "frame_id": frame["frame_id"],
                     "xs": xs,
                     "ys": ys,
                     "features": features,
                     "compute_ms": compute_ms,
-                })
+                }
+                if self._result_mailbox.publish(result):
+                    self.result_available.emit()
             except Exception as exc:
                 print(f"[RadarWorker] 计算错误: {exc}")
 
@@ -1674,6 +1783,8 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
 
     def __init__(self, sensor=None, max_hist_time=3):
         super().__init__()
+        self._gui_rates = FrameRateCounter()
+        self._shutdown_complete = False
         self.sensor = sensor
         self.device_type = getattr(sensor, 'device_type', None)
         self.current_port = None
@@ -2188,13 +2299,14 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         self._current_pressure_index = 1 if self.device_type == 'curved' else 0
         self.pressure_stack.setCurrentIndex(self._current_pressure_index)
 
-        
+
         self._sensor_worker = None
 
         
         self._radar_generation = 0
         self._radar_feature_worker = RadarFeatureWorker()
-        self._radar_feature_worker.radar_ready.connect(self._on_radar_ready)
+        self._radar_feature_worker.result_available.connect(
+            self._consume_radar_result, QtCore.Qt.QueuedConnection)
         self._radar_feature_worker.start()
 
         self._startup_scan_worker = None
@@ -2204,7 +2316,6 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         
         self._manual_connect_pending_args = None
 
-        
         self._apply_device_slider_config(self.device_type)
         self._reset_runtime_metrics()
         self._set_sensor_controls_enabled(self.sensor is not None)
@@ -2239,6 +2350,7 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         self.autocal_toggle_btn.setEnabled(bool(connected))
 
     def _reset_runtime_metrics(self, side_map_text="正在等待设备数据..."):
+        self._reset_rate_windows()
         self.fx_value_label.setText("Fx: -- mN")
         self.fy_value_label.setText("Fy: -- mN")
         self.fz_value_label.setText("Fz: -- mN")
@@ -2257,22 +2369,30 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         self._startup_connect_request_id += 1
         return self._startup_connect_request_id
 
+    def _reset_rate_windows(self):
+        rates = getattr(self, '_gui_rates', None)
+        if rates is not None:
+            rates.reset()
+
     def start_sensor_worker(self):
         if self.sensor is None:
             return
         if self._sensor_worker is not None and self._sensor_worker.isRunning():
             return
+        self._reset_rate_windows()
         self._sensor_worker = SensorUpdateWorker(self.sensor)
-        self._sensor_worker.new_frame.connect(self._on_new_frame, QtCore.Qt.QueuedConnection)
+        self._sensor_worker.frame_available.connect(
+            self._consume_sensor_frame, QtCore.Qt.QueuedConnection)
         self._sensor_worker.error_occurred.connect(self._on_worker_error, QtCore.Qt.QueuedConnection)
         self._sensor_worker.start()
 
     def stop_sensor_worker(self, timeout=2000):
         worker = self._sensor_worker
+        self._sensor_worker = None
         if worker is None:
             return True
+        worker.close_mailbox()
         if not worker.isRunning():
-            self._sensor_worker = None
             return True
         worker.requestInterruption()
         if not worker.wait(timeout):
@@ -2280,7 +2400,6 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
             worker.terminate()
             worker.wait()
             return False
-        self._sensor_worker = None
         return True
 
     def begin_startup_auto_connect(self):
@@ -2396,6 +2515,7 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
 
             print(f"启动自动连接USB端口: {sensor_obj.usb_id}")
         except Exception as e:
+            self.stop_sensor_worker()
             try:
                 sensor_obj.release()
             except Exception:
@@ -2605,16 +2725,19 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         self._reset_radar_state()
         try:
             self.sensor.calibrate_baseline(10)
-            self.start_sensor_worker()
             print("校准完成！")
         except Exception as e:
             print(f"校准出错: {e}")
+        finally:
+            self._reset_rate_windows()
             if not self.should_exit:
                 self.start_sensor_worker()
-        finally:
             QtCore.QTimer.singleShot(1000, lambda: setattr(self, 'button_processing', False))
 
     def quit_application(self):
+        if getattr(self, '_shutdown_complete', False):
+            return
+        self.should_exit = True
         self._invalidate_startup_auto_connect()
         self._manual_connect_pending_args = None
         init_worker = getattr(self, '_sensor_init_worker', None)
@@ -2623,13 +2746,13 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
             init_worker.wait(1000)
         self.stop_sensor_worker()
         self.close()
-        self.should_exit = True
         QtWidgets.QApplication.quit()
 
     def _manual_connect_via_port_selector(self, auto_scan, keep_main_on_cancel=False):
         self._invalidate_startup_auto_connect()
         if not self.stop_sensor_worker():
             return False
+        self._reset_radar_state()
 
         
         
@@ -2677,12 +2800,14 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
             return True
         except ValueError as e:
             if new_sensor is not None:
+                self.stop_sensor_worker()
                 new_sensor.release()
             QtWidgets.QMessageBox.critical(self, "设备标识错误", str(e) + "\n\n程序将强制退出。")
             self.quit_application()
             return False
         except Exception as e:
             if new_sensor is not None:
+                self.stop_sensor_worker()
                 new_sensor.release()
             print(f"初始化失败: {e}")
             QtWidgets.QMessageBox.critical(
@@ -2725,6 +2850,10 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         return
 
     def closeEvent(self, event):
+        if getattr(self, '_shutdown_complete', False):
+            event.accept()
+            return
+        self.should_exit = True
         self._invalidate_startup_auto_connect()
         self._manual_connect_pending_args = None
         init_worker = getattr(self, '_sensor_init_worker', None)
@@ -2738,6 +2867,7 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
             self.sensor.release()
             self.sensor = None
         self._stop_radar_feature_worker()
+        self._shutdown_complete = True
         super().closeEvent(event)
 
     def handle_key_press(self, event):
@@ -2749,13 +2879,18 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         else:
             super().keyPressEvent(event)
 
+    @QtCore.pyqtSlot()
+    def _consume_sensor_frame(self):
+        worker = self._sensor_worker
+        if self.should_exit or worker is None or self.sender() is not worker:
+            return
+        packet = worker.take_latest_frame()
+        if packet is not None:
+            self._on_new_frame(packet)
+
     @QtCore.pyqtSlot(dict)
     def _on_new_frame(self, packet):
-        """Slot: receives sensor packet via Qt signal, renders immediately.
-
-        No polling, no lock, no frame skip — every sensor frame is rendered.
-        GUI FPS == sensor FPS exactly.
-        """
+        """Render the latest completed sensor snapshot on the GUI thread."""
         if self.should_exit:
             return
 
@@ -2818,8 +2953,7 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
             qimg = QImage(preview_rgb.data, pw, ph, 3 * pw, QImage.Format_RGB888)
             pix = QPixmap.fromImage(qimg)
             pix = pix.scaled(
-                self.side_map_label.width(),
-                self.side_map_label.height(),
+                self.side_map_label.contentsRect().size(),
                 QtCore.Qt.KeepAspectRatio,
                 QtCore.Qt.SmoothTransformation
             )
@@ -2837,6 +2971,9 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
     @QtCore.pyqtSlot(str)
     def _on_worker_error(self, error_msg):
         """Slot: handles sensor worker errors (emitted from QThread)."""
+        worker = self._sensor_worker
+        if self.should_exit or worker is None or self.sender() is not worker:
+            return
         print(f"传感器线程错误: {error_msg}")
         self.should_exit = True
         self.stop_sensor_worker()
@@ -2846,10 +2983,19 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         )
         self.quit_application()
 
+    @QtCore.pyqtSlot()
+    def _consume_radar_result(self):
+        worker = self._radar_feature_worker
+        if self.should_exit or worker is None or self.sender() is not worker:
+            return
+        result = worker.take_latest_result()
+        if result is not None:
+            self._on_radar_ready(result)
+
     @QtCore.pyqtSlot(object)
     def _on_radar_ready(self, result):
         """Slot: 接收雷达特征计算结果，更新中间面板雷达图与状态文字。"""
-        if result["generation"] != self._radar_generation:
+        if self.should_exit or result["generation"] != self._radar_generation:
             return
 
         features = result["features"]
@@ -2871,8 +3017,10 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         self.radar_status_label.setText("状态: 等待数据")
     def _stop_radar_feature_worker(self):
         worker = getattr(self, "_radar_feature_worker", None)
+        self._radar_feature_worker = None
         if worker is None:
             return
+        worker.close_mailbox()
         worker.requestInterruption()
         worker.wake()
         if not worker.wait(2000):

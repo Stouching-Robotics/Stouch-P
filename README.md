@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-3.3.6-brightgreen.svg)]()
+[![Version](https://img.shields.io/badge/Version-3.4.0-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![OpenCV](https://img.shields.io/badge/OpenCV_headless-4.x-green.svg)](https://opencv.org/)
 [![PyQt5](https://img.shields.io/badge/PyQt5-5.15-orange.svg)](https://www.riverbankcomputing.com/software/pyqt/)
