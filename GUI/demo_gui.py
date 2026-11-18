@@ -36,7 +36,7 @@ from radar import RadarPlotWidget, RadarComputeWorker
 from usb_port import USBPortSelector, USBPortScanner
 import time
 
-GUI_VERSION = "2.3.9"
+GUI_VERSION = "2.4.1"
 
 def _resource_path(rel):
     """定位随包资源文件。
@@ -1733,9 +1733,9 @@ DEVICE_SLIDER_CONFIG = {
         'arrow_z':  {'range': (10, 300),  'default': 150},    
     },
     'curved': {
-        'heatmap':  {'range': (10, 6000), 'default': 2000},   
-        'arrow_xy': {'range': (10, 1500), 'default': 750},    
-        'arrow_z':  {'range': (10, 600),  'default': 250},    
+        'heatmap':  {'range': (10, 6000), 'default': 800},   
+        'arrow_xy': {'range': (10, 1500), 'default': 400},    
+        'arrow_z':  {'range': (10, 600),  'default': 200},    
     },
 }
 
@@ -1913,7 +1913,7 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
             force_info_layout.addWidget(lbl)
 
         
-        self.heatmap_scale = 70.0
+        self.heatmap_scale = 80
         self.heatmap_scale_title = QtWidgets.QLabel("热力图缩放")
         self.heatmap_scale_title.setStyleSheet(
             f"color:#e5e7eb; font-size:{self._pt(10.5):.1f}pt; font-weight:650;")
@@ -1972,7 +1972,7 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         force_info_layout.addLayout(scale_slider_layout)
 
         
-        self.arrow_xy_scale = 100.0  
+        self.arrow_xy_scale = 40  
         self.arrow_scale_title = QtWidgets.QLabel("箭头XY比例")
         self.arrow_scale_title.setStyleSheet(
             f"color:#e5e7eb; font-size:{self._pt(10.5):.1f}pt; font-weight:650;")
@@ -2025,7 +2025,7 @@ class Force3DSurfaceApp(QtWidgets.QWidget):
         force_info_layout.addLayout(arrow_scale_slider_layout)
 
         
-        self.arrow_z_scale = 15.0  
+        self.arrow_z_scale = 20  
         self.arrow_z_scale_title = QtWidgets.QLabel("箭头Z比例")
         self.arrow_z_scale_title.setStyleSheet(
             f"color:#e5e7eb; font-size:{self._pt(10):.1f}pt; font-weight:650;")
